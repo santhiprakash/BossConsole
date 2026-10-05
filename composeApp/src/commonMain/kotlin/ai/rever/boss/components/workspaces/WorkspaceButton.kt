@@ -433,11 +433,18 @@ fun WorkspaceButton(
         OpenWorkspaceDialog(
             onDismiss = { showOpenDialog = false },
             onOpen = { jsonString ->
-                workspaceManager.importWorkspace(jsonString)?.let { workspace ->
+                val imported = workspaceManager.importWorkspace(jsonString)
+                if (imported != null) {
                     // Let the apply/switch callback claim the Space only after it proves that
                     // the imported layout can build at least one declared tab. Claiming it here
                     // would leave the manager pointing at an unapplied Space on refusal.
-                    onOpenWorkspace(workspace)
+                    onOpenWorkspace(imported)
+                } else {
+                    // A null is a refusal - unreadable JSON, or a write target on a reserved
+                    // store record - logged inside importWorkspace. It used to close the dialog
+                    // silently; the person holding it gets the same answer the save path's
+                    // refusal gives (#1820).
+                    StatusMessageManager.showMessage("Could not import that Space")
                 }
                 showOpenDialog = false
             },

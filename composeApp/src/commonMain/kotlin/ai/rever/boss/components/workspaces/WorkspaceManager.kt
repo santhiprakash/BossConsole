@@ -166,6 +166,46 @@ class WorkspaceManager(
     private fun fileNameFor(workspace: LayoutWorkspace): String =
         loadedFileNames[workspace.id] ?: WorkspaceFileManagerCommon.fileNameForId(workspace.id)
 
+    /**
+     * Where [workspace] may be WRITTEN - or deleted through: [fileNameFor]'s answer, or null
+     * when that answer is a reserved store record this writer must not touch (#1820).
+     *
+     * The gate lives here, at the one place every write target is resolved, because the
+     * reserved name can arrive two ways and an id-level check sees only one of them: an id
+     * that itself resolves onto a record (`Space_Themes` -> `Space_Themes.json`), AND a
+     * `loadedFileNames` binding - a file on disk NAMED like a record can hold contents that
+     * parse as a Space carrying an ordinary id (only the document records are scan-skipped;
+     * a corrupt or hand-edited `Last_Session.json` still loads), and the scan used to record
+     * that name under the foreign id. Without this, `saveCurrentWorkspace` rewrote the
+     * session record, `renameWorkspaceById` rewrote it, and `deleteWorkspaceById` deleted it.
+     *
+     * One id is allowed through: [LAST_SESSION_ID], the record's own. The live record writes
+     * `last-session.json`, and one loaded off a pre-[WorkspaceFileManagerCommon.fileNameForId]
+     * install keeps writing `Last_Session.json` through its `loadedFileNames` binding - both
+     * are session-record spellings, not document records. The document records
+     * (`Space_Themes.json`, `Last_Session_Set.json`) have no legitimate writer on this path at
+     * all: they are written through `writeDocumentBlocking`, and they are refused here even
+     * for the session id.
+     */
+    private fun writeTargetFor(workspace: LayoutWorkspace): String? =
+        fileNameFor(workspace).takeUnless { isReservedTargetForOtherId(it, workspace.id) }
+
+    /**
+     * Whether the resolved [fileName] is a reserved store record [workspaceId] must not write:
+     * every reserved name for a foreign id, and the DOCUMENT records even for [LAST_SESSION_ID] -
+     * the record's own writer only ever lands on a session-record spelling. Shared by the scan
+     * (which must not create such a binding) and [writeTargetFor] (which must not honour one),
+     * so the two cannot drift.
+     */
+    private fun isReservedTargetForOtherId(
+        fileName: String,
+        workspaceId: String,
+    ): Boolean {
+        reservedWorkspaceStoreFileName(fileName) ?: return false
+        return !workspaceId.equals(LAST_SESSION_ID, ignoreCase = true) ||
+            WorkspaceFileManagerCommon.isReservedDocumentFileName(fileName)
+    }
+
     // Callback for when a workspace is deleted
     private var onWorkspaceDeleted: ((String) -> Unit)? = null
 
@@ -309,55 +349,7 @@ class WorkspaceManager(
                     // shared with the write-side guard, which extends it with the session-record
                     // spellings it must refuse too, so the two cannot drift apart (#926).
                     if (WorkspaceFileManagerCommon.isReservedDocumentFileName(fileInfo.fileName)) return@forEach
-                    val workspace =
-                        withContext(Dispatchers.IO) {
-                            fileManager.loadWorkspace(fileInfo.fileName)
-                        }
-                    workspace?.let {
-                        // Ensure workspace has an ID
-                        val withId = it.withStableId()
-                        if (fileInfo.fileName == ".json") {
-                            // A legacy id-less build wrote the literal file ".json" - and that
-                            // file IS a real Space (the last id-less import, the one that
-                            // survived the overwrite). Adopt it: save the Space under its own
-                            // <id>.json and remove the nameless file so it is not re-adopted
-                            // every launch. Never write it back AS ".json".
-                            val adoptedName = WorkspaceFileManagerCommon.fileNameForId(withId.id)
-                            if (fileManager.saveWorkspace(withId, adoptedName) != null) {
-                                runCatching { fileManager.deleteWorkspace(".json") }
-                            } else {
-                                logger.warn(
-                                    LogCategory.WORKSPACE,
-                                    "Could not adopt a legacy nameless workspace file - it will be retried next launch",
-                                )
-                            }
-                            saved.add(withId)
-                            loadedFileNames[withId.id] = adoptedName
-                            return@forEach
-                        }
-                        if (withId !== it) {
-                            // A file carrying no id minted a fresh one on EVERY launch, so the
-                            // Space's identity - session-set membership, preserved-state keys -
-                            // never matched across a relaunch. Write the minted id back into the
-                            // file it came from, once, and the next load reads a stable id. The
-                            // serializer re-emits the model, so a hand-maintained file loses its
-                            // formatting and unknown keys: BOSS takes ownership of the file on
-                            // first launch. If the write fails the next launch would mint yet
-                            // another id - the original bug, silently - so say so.
-                            if (fileManager.saveWorkspace(withId, fileInfo.fileName) == null) {
-                                logger.warn(
-                                    LogCategory.WORKSPACE,
-                                    "Could not persist a minted workspace id - it will be re-minted next launch",
-                                    mapOf("fileName" to fileInfo.fileName),
-                                )
-                            }
-                        }
-                        saved.add(withId)
-                        // Remember the file it came from, so a legacy path keeps being this
-                        // Space's file. A file already named `<id>.json` records the same answer
-                        // `fileNameFor` would derive, so the entry is harmless either way.
-                        loadedFileNames[withId.id] = fileInfo.fileName
-                    }
+                    adoptScannedWorkspace(fileInfo, saved)
                 }
             } catch (e: Exception) {
                 // Log error but continue with predefined workspaces
@@ -371,6 +363,111 @@ class WorkspaceManager(
             // built-in's.
             _workspaces.value = mergeSavedWorkspaces(PredefinedWorkspaces.allWorkspaces, saved)
         }
+    }
+
+    /**
+     * Adopt one file the directory scan found into [saved]: read it, give it a stable id, and
+     * remember the file it came from - or refuse that binding when the file is a reserved store
+     * record carrying another id (#1820).
+     */
+    private suspend fun adoptScannedWorkspace(
+        fileInfo: WorkspaceFileInfo,
+        saved: MutableList<LayoutWorkspace>,
+    ) {
+        val workspace =
+            withContext(Dispatchers.IO) {
+                fileManager.loadWorkspace(fileInfo.fileName)
+            } ?: return
+        // Ensure workspace has an ID
+        val withId = workspace.withStableId()
+        if (fileInfo.fileName == ".json") {
+            adoptNamelessWorkspace(withId, saved)
+            return
+        }
+        // A file NAMED like a store record but carrying another id is not the record. Only the
+        // document records are skipped by the caller, so a corrupt or hand-edited
+        // `Last_Session.json` / `last-session.json` still loads as a Space - which is fine, but
+        // it must not keep the name: the binding and the id write-back below would both put a
+        // foreign id's writes onto the record file. The real record is exempt - it carries
+        // [LAST_SESSION_ID] legitimately, and a legacy `Last_Session.json` stays its file.
+        val reservedNameForOtherId = isReservedTargetForOtherId(fileInfo.fileName, withId.id)
+        if (withId !== workspace) {
+            // A file carrying no id minted a fresh one on EVERY launch, so the
+            // Space's identity - session-set membership, preserved-state keys -
+            // never matched across a relaunch. Write the minted id back into the
+            // file it came from, once, and the next load reads a stable id. The
+            // serializer re-emits the model, so a hand-maintained file loses its
+            // formatting and unknown keys: BOSS takes ownership of the file on
+            // first launch. If the write fails the next launch would mint yet
+            // another id - the original bug, silently - so say so.
+            //
+            // A reserved name under a foreign id is refused the write entirely:
+            // persisting the minted id into `Last_Session.json` is a write to the
+            // record itself (#1820), on a case-insensitive filesystem the very
+            // file the live record writes. The Space loads regardless and mints
+            // again next launch - the lesser cost.
+            if (reservedNameForOtherId) {
+                logger.warn(
+                    LogCategory.WORKSPACE,
+                    "Refusing to persist a minted workspace id into the reserved store file",
+                    mapOf("fileName" to fileInfo.fileName),
+                )
+            } else if (fileManager.saveWorkspace(withId, fileInfo.fileName) == null) {
+                logger.warn(
+                    LogCategory.WORKSPACE,
+                    "Could not persist a minted workspace id - it will be re-minted next launch",
+                    mapOf("fileName" to fileInfo.fileName),
+                )
+            }
+        }
+        saved.add(withId)
+        // Remember the file it came from, so a legacy path keeps being this
+        // Space's file. A file already named `<id>.json` records the same answer
+        // `fileNameFor` would derive, so the entry is harmless either way.
+        //
+        // A reserved name under a foreign id is the one harmful entry: it is how
+        // this Space's save/rename/delete used to reach the store record, and it
+        // is the state `writeTargetFor` now refuses (#1820).
+        if (!reservedNameForOtherId) {
+            loadedFileNames[withId.id] = fileInfo.fileName
+        }
+    }
+
+    /**
+     * Adopt the legacy nameless workspace file: a pre-id build wrote the literal `.json`, and
+     * that file IS a real Space (the last id-less import, the one that survived the
+     * overwrite). Save it under its own `<id>.json` and remove the nameless file so it is not
+     * re-adopted every launch. Never write it back AS `.json`.
+     *
+     * The one refusal: a nameless file can still carry an id whose own `fileNameForId` lands
+     * on a store record - `{"id":"Space_Themes"}` - and adopting it would write the record
+     * (#1820). Load it unbound instead: the write gate refuses its saves, and the next launch
+     * refuses the adoption again.
+     */
+    private suspend fun adoptNamelessWorkspace(
+        withId: LayoutWorkspace,
+        saved: MutableList<LayoutWorkspace>,
+    ) {
+        val adoptedName = WorkspaceFileManagerCommon.fileNameForId(withId.id)
+        if (isReservedTargetForOtherId(adoptedName, withId.id)) {
+            logger.warn(
+                LogCategory.WORKSPACE,
+                "Refusing to adopt the nameless workspace file onto the reserved store file '$adoptedName'",
+                mapOf("workspaceId" to withId.id),
+            )
+            saved.add(withId)
+            return
+        }
+        if (fileManager.saveWorkspace(withId, adoptedName) != null) {
+            runCatching { fileManager.deleteWorkspace(".json") }
+        } else {
+            logger.warn(
+                LogCategory.WORKSPACE,
+                "Could not adopt a legacy nameless workspace file - it will be retried next launch",
+            )
+        }
+        saved.add(withId)
+        loadedFileNames[withId.id] = adoptedName
     }
 
     /**
@@ -434,9 +531,34 @@ class WorkspaceManager(
                 )
             }
 
+        writeSavedWorkspace(savedWorkspace, onSaved, onFailed)
+
+        return savedWorkspace
+    }
+
+    /**
+     * Write [savedWorkspace] to disk on the manager's scope and, once the bytes landed, commit
+     * it to the list and fire [onSaved]. [onFailed] hears about BOTH failure answers: a write
+     * the store refused through the reserved-name gate, and a write the filesystem refused.
+     */
+    private fun writeSavedWorkspace(
+        savedWorkspace: LayoutWorkspace,
+        onSaved: (LayoutWorkspace) -> Unit,
+        onFailed: (String) -> Unit,
+    ) {
         scope.launch {
-            // Save to disk (on IO thread)
-            val fileName = fileNameFor(savedWorkspace)
+            // Save to disk (on IO thread), through the reserved-store gate: a Space whose
+            // resolved target is a store record is refused, not written over it (#1820).
+            val fileName = writeTargetFor(savedWorkspace)
+            if (fileName == null) {
+                logger.warn(
+                    LogCategory.WORKSPACE,
+                    "Refusing to save a Space over the reserved store file '${fileNameFor(savedWorkspace)}'",
+                    mapOf("workspace" to savedWorkspace.name, "id" to savedWorkspace.id),
+                )
+                onFailed(savedWorkspace.name)
+                return@launch
+            }
             val filePath =
                 withContext(Dispatchers.IO) {
                     fileManager.saveWorkspace(savedWorkspace, fileName)
@@ -473,8 +595,6 @@ class WorkspaceManager(
                 onFailed(savedWorkspace.name)
             }
         }
-
-        return savedWorkspace
     }
 
     /**
@@ -491,7 +611,9 @@ class WorkspaceManager(
      * `LayoutWatcherWrite.current`, which is the live layout under the identity it already has.
      */
     fun writeLastSessionRecordBlocking(record: LayoutWorkspace): Boolean {
-        if (fileManager.saveWorkspaceBlocking(record, fileNameFor(record)) != null) return true
+        // The one id `writeTargetFor` lets onto a reserved name: this IS the record's writer.
+        val fileName = writeTargetFor(record)
+        if (fileName != null && fileManager.saveWorkspaceBlocking(record, fileName) != null) return true
         logger.warn(LogCategory.WORKSPACE, "Last Session record write failed")
         return false
     }
@@ -531,8 +653,8 @@ class WorkspaceManager(
             asLastSession(layout).copy(
                 timestamp = Clock.System.now().toEpochMilliseconds(),
             )
-        val fileName = fileNameFor(lastSession)
-        val filePath = fileManager.saveWorkspaceBlocking(lastSession, fileName)
+        val fileName = writeTargetFor(lastSession)
+        val filePath = fileName?.let { fileManager.saveWorkspaceBlocking(lastSession, it) }
         if (filePath == null) {
             logger.warn(LogCategory.WORKSPACE, "Last Session save failed", mapOf("workspace" to lastSession.name))
             return false
@@ -638,19 +760,19 @@ class WorkspaceManager(
             val workspace = if (uniqueName != withSafeId.name) withSafeId.copy(name = uniqueName) else withSafeId
 
             // The reserved-store gate the MCP create path applies to a caller-chosen id (#926,
-            // #964), evaluated on the name the save will write (#1627). withImportableId re-mints
-            // an id whose own fileNameForId lands on a reserved record, but fileNameFor can
-            // instead answer a name the load scan recorded into loadedFileNames - a name the
-            // identity rule never consulted - so the check runs on the actual write target.
-            // Refusal mirrors the MCP answer: before anything is created or applied, so the
-            // import reports failure whole rather than registering a Space that never persisted.
-            val fileName = fileNameFor(workspace)
-            val reserved = reservedWorkspaceStoreFileName(fileName)
-            if (reserved != null) {
+            // #964), evaluated on the name the save will write (#1627) through the helper every
+            // writer now resolves the target with (#1820). withImportableId re-mints an id whose
+            // own fileNameForId lands on a reserved record, but fileNameFor can instead answer a
+            // name the load scan recorded into loadedFileNames - a name the identity rule never
+            // consulted - so the check runs on the actual write target. Refusal mirrors the MCP
+            // answer: before anything is created or applied, so the import reports failure whole
+            // rather than registering a Space that never persisted.
+            val fileName = writeTargetFor(workspace)
+            if (fileName == null) {
                 logger.warn(
                     LogCategory.WORKSPACE,
-                    "Refusing to import a workspace onto the reserved store file '$reserved'",
-                    mapOf("workspaceId" to workspace.id, "fileName" to fileName),
+                    "Refusing to import a workspace onto the reserved store file '${fileNameFor(workspace)}'",
+                    mapOf("workspaceId" to workspace.id),
                 )
                 null
             } else {
@@ -734,9 +856,20 @@ class WorkspaceManager(
             // where the shipped Codex is not. By name the veto refused both.
             if (!isUserOwnedSpace(workspaceId)) return@launch
 
+            // The same gate the writes take: a Space bound to a reserved store file is refused,
+            // not used to delete the record (#1820).
+            val fileName = writeTargetFor(workspace)
+            if (fileName == null) {
+                logger.warn(
+                    LogCategory.WORKSPACE,
+                    "Refusing to delete the reserved store file '${fileNameFor(workspace)}'",
+                    mapOf("workspaceId" to workspaceId),
+                )
+                return@launch
+            }
             val deleted =
                 withContext(Dispatchers.IO) {
-                    fileManager.deleteWorkspace(fileNameFor(workspace))
+                    fileManager.deleteWorkspace(fileName)
                 }
             if (deleted) {
                 // Update state on Main thread
@@ -797,7 +930,17 @@ class WorkspaceManager(
                     timestamp = Clock.System.now().toEpochMilliseconds(),
                 )
 
-            val fileName = fileNameFor(renamedWorkspace)
+            // A rename writes through the same gate: a Space bound to a reserved store file is
+            // refused rather than saved over the record under its new name (#1820).
+            val fileName = writeTargetFor(renamedWorkspace)
+            if (fileName == null) {
+                logger.warn(
+                    LogCategory.WORKSPACE,
+                    "Refusing to rename a Space onto the reserved store file '${fileNameFor(renamedWorkspace)}'",
+                    mapOf("workspaceId" to workspaceId),
+                )
+                return@launch
+            }
             val success =
                 withContext(Dispatchers.IO) {
                     fileManager.saveWorkspace(renamedWorkspace, fileName) != null

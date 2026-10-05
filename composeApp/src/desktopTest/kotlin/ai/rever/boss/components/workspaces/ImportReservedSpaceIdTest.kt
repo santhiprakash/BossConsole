@@ -170,21 +170,24 @@ class ImportReservedSpaceIdTest {
     }
 
     /**
-     * The gate #1627 asks for, driven through the real manager. `withImportableId` checks the id
-     * against `fileNameForId`, but `fileNameFor` answers a name the load scan recorded into
-     * `loadedFileNames` first - a file on disk named like a session record whose contents carry
-     * an ordinary id passes the identity rule and then saves over the record. The refusal lands
-     * before the write is even queued, so the record is byte-identical no matter when Main runs.
+     * The state #1627's gate was written for, seen from the far side of #1820: a file NAMED like
+     * the session record but carrying an ordinary id no longer gets its name recorded into
+     * `loadedFileNames` at all - the scan refuses that binding. So an import carrying the same id
+     * resolves its write target to the derived `<id>.json`, a safe name, and is ALLOWED to land
+     * there: the gate protects the record file, it does not make the Space unpersistable. The
+     * record stays byte-identical because the write never names it, not because the import was
+     * refused.
      */
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
-    fun `import resolved onto a recorded reserved file name is refused before the write`() =
+    fun `import of an id read out of a record-named file is re-homed, never written to the record`() =
         runTest {
             Dispatchers.setMain(StandardTestDispatcher(testScheduler))
             try {
                 // A Space file at the legacy session-record spelling, but carrying an ordinary
-                // id: the scan skips only the DOCUMENT records, so it loads as a Space and is
-                // recorded - loadedFileNames["victim-space"] = "Last_Session.json".
+                // id: the scan skips only the DOCUMENT records, so it loads as a Space - but
+                // since #1820 it is NOT recorded under the reserved name, so `fileNameFor`
+                // answers `victim-space.json` for it.
                 val sessionFile = File(dir, LEGACY_LAST_SESSION_FILE)
                 sessionFile.writeText(
                     WorkspaceSerializer.serialize(
@@ -200,12 +203,13 @@ class ImportReservedSpaceIdTest {
                         LayoutWorkspace(id = "victim-space", name = "Re-imported", description = "d", layout = layout),
                     )
 
-                assertNull(
-                    manager.importWorkspace(document),
-                    "the write target resolves to a session record - the import must be refused",
+                val imported = manager.importWorkspace(document)
+                assertNotNull(
+                    imported,
+                    "the write target resolves to the derived <id>.json - a safe name - so the import lands",
                 )
-                Thread.sleep(50)
-                runCurrent()
+                val rehomed = File(dir, WorkspaceFileManagerCommon.fileNameForId(imported.id))
+                awaitMain { rehomed.exists() }
                 assertEquals(untouched, sessionFile.readText(), "the reserved record is never written")
             } finally {
                 Dispatchers.resetMain()
@@ -258,7 +262,9 @@ class ImportReservedSpaceIdTest {
                     ?.readText(),
             ) { "could not find $relative" }
         val importBody = source.substringAfter("fun importWorkspace(").substringBefore("\n    fun ")
-        val gate = importBody.indexOf("reservedWorkspaceStoreFileName(")
+        // The reserved-store check lives in writeTargetFor, the helper every writer resolves
+        // its target through (#1820); the pin is that the import consults it before the save.
+        val gate = importBody.indexOf("writeTargetFor(")
         val save = importBody.indexOf("fileManager.saveWorkspace(")
 
         assertTrue(gate >= 0, "importWorkspace must check the write target against the reserved store files")
